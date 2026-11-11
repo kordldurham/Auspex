@@ -96,3 +96,20 @@ and byte count when a complete response was read. The `product` member may conta
 any valid JSON type. Collection errors include evidence/status instead of product.
 Server code must persist the incoming raw evidence before matching or rejection,
 return individual rejection reasons, and make repeated acknowledgements idempotent.
+
+### Proof counter definitions
+
+`collected` and `collectionFailures` are client collection outcomes.
+`persistenceAcks` counts successful observe checkpoints.
+`rawEvidenceAcknowledged` counts raw observation records explicitly acknowledged
+by the server, split into `rawProductEvidenceAcknowledged` and
+`rawFailureEvidenceAcknowledged`. These can include retry evidence and are not
+unique matched-listing counts. A missing/incomplete raw-persistence receipt fails
+the worker rather than implying data was saved.
+
+Server job counters are recorded unchanged: `listingsDiscovered` means raw
+collection succeeded, `listingsPersisted` means catalog matching/persistence
+succeeded, and `rejectedListings` means collected evidence was rejected during
+matching. Proof aliases `rawCollectionSucceededListings`,
+`matchedCatalogListings` and `rejectedAfterCollectionListings` make that distinction
+explicit. A raw response can be durably saved while matching rejects it.
