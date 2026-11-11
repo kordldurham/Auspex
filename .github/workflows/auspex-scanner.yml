@@ -1,0 +1,70 @@
+name: Auspex external scanner
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_full:
+        description: Explicitly enqueue a full acceptance scan
+        type: boolean
+        default: false
+      stop_after_batches:
+        description: Deliberately interrupt after N persisted batches (blank runs normally)
+        type: string
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - runner/run-config.json
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: auspex-prod-single-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    # A copied template/fork does not run a production reader. The backend also
+    # enforces immutable numeric repository/owner IDs, ref and workflow identity.
+    if: github.repository == 'kordldurham/Auspex' && vars.AUSPEX_SCANNER_PAUSED != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: runner/requirements.txt
+      - name: Install external reader
+        run: python -m pip install --disable-pip-version-check -r runner/requirements.txt
+      - name: Verify reader
+        run: python -m unittest discover -s runner/tests -v
+      - name: Claim queued work and read permitted sources
+        env:
+          REQUEST_EVENT: ${{ github.event_name }}
+          FORCE_FULL: ${{ inputs.force_full }}
+          STOP_AFTER_BATCHES: ${{ inputs.stop_after_batches }}
+        shell: bash
+        run: |
+          args=(--proof-file runner-proof.json)
+          if [[ "$REQUEST_EVENT" == "push" ]]; then
+            args+=(--run-config runner/run-config.json)
+          elif [[ "$REQUEST_EVENT" == "workflow_dispatch" ]]; then
+            if [[ "$FORCE_FULL" == "true" ]]; then args+=(--force-full); fi
+            if [[ -n "$STOP_AFTER_BATCHES" ]]; then args+=(--stop-after-batches "$STOP_AFTER_BATCHES"); fi
+          fi
+          # Scheduled polls never use an acceptance run-config or force a new job.
+          python -m runner "${args[@]}"
+      - name: Preserve non-secret execution proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auspex-reader-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runner-proof.json
+          if-no-files-found: warn
+          retention-days: 30
