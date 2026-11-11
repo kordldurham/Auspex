@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll Auspex's durable scan queue
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=5min
+Persistent=true
+Unit=auspex-reader.service
+
+[Install]
+WantedBy=timers.target
