@@ -1,0 +1,22 @@
+[Unit]
+Description=Auspex permitted external market reader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=auspex-reader
+WorkingDirectory=/opt/auspex
+EnvironmentFile=/etc/auspex-reader/reader.env
+ExecStart=/opt/auspex/.venv/bin/python -m runner --max-runtime-seconds 3600
+TimeoutStartSec=3700
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+# Non-GitHub deployments require an explicitly configured, least-privilege
+# AUSPEX_RUNNER_BEARER. Do not place a token in this unit or source repository.
