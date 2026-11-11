@@ -322,7 +322,25 @@ class Worker:
         self.stop = asyncio.Event()
         self.job: dict[str, Any] | None = None
         self.batches = 0
-        self.proof = {"collected": 0, "collectionFailures": 0, "persistenceAcks": 0}
+        self.proof = {"collected": 0, "collectionFailures": 0, "persistenceAcks": 0,
+                      "rawEvidenceAcknowledged": 0, "rawProductEvidenceAcknowledged": 0,
+                      "rawFailureEvidenceAcknowledged": 0}
+
+    def acknowledge_raw(self, ack: dict[str, Any], results: list[Collection]) -> None:
+        counts = ack.get("rawPersisted")
+        if not isinstance(counts, dict):
+            raise ReaderError("Server did not acknowledge raw evidence persistence")
+        collected, errors = counts.get("collected"), counts.get("collectionErrors")
+        if (isinstance(collected, bool) or isinstance(errors, bool) or
+                not isinstance(collected, int) or not isinstance(errors, int) or
+                collected < 0 or errors < 0 or collected + errors != len(results)):
+            raise ReaderError("Raw persistence acknowledgement does not cover this collection batch")
+        self.proof["persistenceAcks"] += 1
+        self.proof["rawEvidenceAcknowledged"] += collected + errors
+        self.proof["rawProductEvidenceAcknowledged"] += collected
+        self.proof["rawFailureEvidenceAcknowledged"] += errors
+        self.proof["collected"] += sum(r.observation.get("collection", {}).get("status") == "collected" for r in results)
+        self.proof["collectionFailures"] += sum(r.observation.get("collection", {}).get("status") != "collected" for r in results)
 
     async def heartbeat(self) -> None:
         while not self.stop.is_set():
@@ -376,9 +394,7 @@ class Worker:
                                "shopChecks": list({r.shop_check["id"]: r.shop_check for r in chunk if r.shop_check}.values())}
                     ack = await self.api.call("observe", payload)
                     self.job = ack.get("job") or self.job
-                    self.proof["persistenceAcks"] += 1
-                    self.proof["collected"] += sum(r.observation.get("collection", {}).get("status") == "collected" for r in chunk)
-                    self.proof["collectionFailures"] += sum(r.observation.get("collection", {}).get("status") != "collected" for r in chunk)
+                    self.acknowledge_raw(ack, chunk)
                 self.batches += 1
                 emit("reader-checkpoint", jobId=self.job["id"], batch=self.batches,
                      completed=self.job.get("completed"), total=self.job.get("total"),
@@ -403,7 +419,10 @@ class Worker:
         outcome = {"status": reason, "jobId": self.job["id"], "runnerId": self.api.runner_id,
                    "batches": self.batches, "elapsedSeconds": round(time.monotonic() - started),
                    "releaseAcknowledged": release_ack,
-                   "job": {key: self.job.get(key) for key in ["id", "status", "scope", "total", "completed", "listingsChecked", "observedListings", "verifiedOffers", "rawCollected", "rawPersisted", "matchedListings", "rejectedListings", "retailersAttempted", "retailersSucceeded", "lastCheckpoint"]}, **self.proof}
+                   "job": {key: self.job.get(key) for key in ["id", "status", "scope", "total", "completed", "listingsChecked", "observedListings", "verifiedOffers", "listingsDiscovered", "listingsPersisted", "rejectedListings", "retailersAttempted", "retailersSucceeded", "lastCheckpoint"]}, **self.proof}
+        outcome["job"]["matchedCatalogListings"] = self.job.get("listingsPersisted")
+        outcome["job"]["rawCollectionSucceededListings"] = self.job.get("listingsDiscovered")
+        outcome["job"]["rejectedAfterCollectionListings"] = self.job.get("rejectedListings")
         emit("reader-exit", status=reason, jobId=self.job["id"], batches=self.batches,
              elapsedSeconds=outcome["elapsedSeconds"], **self.proof)
         return outcome
