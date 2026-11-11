@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "requestId": "idle",
-  "forceFull": false,
+  "requestId": "acceptance-1-full-2026-11-11",
+  "forceFull": true,
   "stopAfterBatches": 0
 }
