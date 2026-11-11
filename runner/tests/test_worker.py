@@ -128,6 +128,8 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
         api = FakeApi()
         first = await Worker(api, FakeCollector(), stop_after_batches=1).run()
         self.assertEqual(first['status'], 'interrupted')
+        self.assertEqual(first['rawEvidenceAcknowledged'], 1)
+        self.assertEqual(first['rawProductEvidenceAcknowledged'], 1)
         self.assertEqual(api.done, ['a'])
         second = await Worker(api, FakeCollector()).run()
         self.assertEqual(second['jobId'], first['jobId'])
@@ -152,6 +154,20 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'idle')
         self.assertEqual(api.actions, ['claim'])
         self.assertFalse(api.claim_payload['forceFull'])
+
+    def test_raw_persistence_proof_is_distinct_from_matched_catalog_counts(self):
+        worker = Worker(FakeApi(), FakeCollector())
+        results = [Collection({'id': 'a', 'collection': {'status': 'collected'}}, None),
+                   Collection({'id': 'b', 'collection': {'status': 'collected'}}, None),
+                   Collection({'id': 'c', 'collection': {'status': 'http-error'}}, None)]
+        worker.acknowledge_raw({'rawPersisted': {'collected': 2, 'collectionErrors': 1},
+                                'job': {'listingsDiscovered': 2, 'listingsPersisted': 1, 'rejectedListings': 1}}, results)
+        self.assertEqual(worker.proof['rawEvidenceAcknowledged'], 3)
+        self.assertEqual(worker.proof['rawProductEvidenceAcknowledged'], 2)
+        self.assertEqual(worker.proof['rawFailureEvidenceAcknowledged'], 1)
+        self.assertEqual(worker.proof['persistenceAcks'], 1)
+        with self.assertRaises(RuntimeError):
+            worker.acknowledge_raw({'rawPersisted': {'collected': 1, 'collectionErrors': 0}}, results)
 
     def test_push_run_config_and_scheduled_default_are_distinct(self):
         self.assertFalse(arguments([]).force_full)
@@ -198,7 +214,7 @@ class FakeApi:
             for item in payload['observations']:
                 if item['id'] not in self.done:
                     self.done.append(item['id'])
-            return {'job': self.job()}
+            return {'job': self.job(), 'rawPersisted': {'collected': len(payload['observations']), 'collectionErrors': 0}}
         if action == 'release':
             self.releases.append(payload['reason'])
             return {'job': self.job()}
