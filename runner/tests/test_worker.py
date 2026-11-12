@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 
 import httpx
 
-from runner.worker import AUDIENCE, SITE, Api, Auth, Collection, Collector, Worker, arguments, observation_chunks, retry_delay, oidc_contract_diagnostics, response_error_diagnostics
+from runner.worker import AUDIENCE, SITE, Api, Auth, Collection, Collector, Worker, arguments, observation_chunks, retry_delay, oidc_contract_diagnostics, response_error_diagnostics, public_preflight
 
 
 def token(expiry):
@@ -65,6 +65,20 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(diagnostic['errorCode'], expected)
             self.assertNotIn('DO-NOT-LOG', json.dumps(diagnostic))
             self.assertEqual(set(diagnostic), {'mediaType', 'errorCode'})
+
+    async def test_public_preflight_is_anonymous_and_never_logs_body(self):
+        async def handle(request):
+            self.assertEqual(str(request.url), SITE + '/api/scans/status')
+            self.assertNotIn('authorization', request.headers)
+            return httpx.Response(403, text='DO-NOT-LOG-BODY', headers={'content-type': 'text/html'})
+        capture = io.StringIO()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            with redirect_stdout(capture):
+                await public_preflight(client)
+        event = json.loads(capture.getvalue())
+        self.assertEqual(event['httpStatus'], 403)
+        self.assertEqual(event['mediaType'], 'text/html')
+        self.assertNotIn('DO-NOT-LOG', capture.getvalue())
 
     async def test_api_does_not_follow_redirect_or_send_auth_to_another_host(self):
         calls = []
