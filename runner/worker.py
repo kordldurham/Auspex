@@ -67,6 +67,57 @@ def emit(event: str, **values: Any) -> None:
     print(json.dumps({"event": event, "at": utc(), **values}), flush=True)
 
 
+def json_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "other"
+
+
+def oidc_contract_diagnostics(claims: dict[str, Any], header: dict[str, Any]) -> dict[str, Any]:
+    # Deliberately emit no claim values, JWT segments, headers or credentials.
+    expected = {"repository_id": "1454612846", "repository_owner_id": "66217662",
+                "aud": AUDIENCE, "ref": "refs/heads/main",
+                "workflow_ref": "kordldurham/Auspex/.github/workflows/auspex-scanner.yml@refs/heads/main",
+                "iss": "https://token.actions.githubusercontent.com",
+                "sub": "repo:kordldurham/Auspex:ref:refs/heads/main"}
+    now = time.time()
+    offsets = {}
+    for key in ("exp", "iat"):
+        value = claims.get(key)
+        offsets[key + "MinusNow"] = round(value - now, 2) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+    return {"verifiedByClient": False,
+            "matches": {key: claims.get(key) == value for key, value in expected.items()},
+            "types": {key: json_type(claims.get(key)) for key in [*expected, "exp", "iat", "nbf", "run_id", "event_name"]},
+            "algorithmMatches": header.get("alg") == "RS256",
+            "algorithmType": json_type(header.get("alg")), "keyIdPresent": bool(header.get("kid")),
+            "runIdIsDigits": isinstance(claims.get("run_id"), (str, int)) and str(claims.get("run_id")).isdigit(),
+            "eventAllowed": isinstance(claims.get("event_name"), str) and claims.get("event_name") in {"push", "schedule", "workflow_dispatch"},
+            **offsets}
+
+
+def response_error_diagnostics(response: httpx.Response) -> dict[str, str]:
+    media = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    # Media labels themselves are bounded; arbitrary header text is never logged.
+    media = media if media in {"application/json", "application/problem+json", "text/html", "text/plain", "application/octet-stream"} else "other" if media else "missing"
+    try:
+        body = response.json()
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        code = "upstream-nonjson"
+    else:
+        code = "identity-rejected" if isinstance(body, dict) and body.get("error") == "Authorized GitHub Actions worker identity required" else "unknown-json-error"
+    return {"mediaType": media, "errorCode": code}
+
+
 def retry_delay(attempt: int, retry_after: str | None = None) -> float:
     if retry_after:
         try:
@@ -137,7 +188,16 @@ class Auth:
                 raise ReaderError("GitHub returned an invalid OIDC token response")
             try:
                 encoded = value.split(".")[1]
-                expiry = float(json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))["exp"])
+                claims = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+                encoded_header = value.split(".")[0]
+                try:
+                    header = json.loads(base64.urlsafe_b64decode(encoded_header + "=" * (-len(encoded_header) % 4)))
+                except (ValueError, UnicodeDecodeError):
+                    header = {}
+                if not isinstance(claims, dict):
+                    raise ValueError("Invalid token payload object")
+                emit("oidc-contract", **oidc_contract_diagnostics(claims, header if isinstance(header, dict) else {}))
+                expiry = float(claims["exp"])
             except (KeyError, ValueError, TypeError):
                 raise ReaderError("OIDC token has no usable expiry") from None
             self.value, self.expires = value, expiry
@@ -175,6 +235,8 @@ class Api:
                         await asyncio.sleep(min(retry_delay(attempt, response.headers.get("Retry-After")), max(0.0, self.deadline - time.monotonic()) if self.deadline else 60.0))
                         continue
                     if response.status_code != 200 and response.status_code != 202:
+                        emit("runner-api-rejected", action=action, httpStatus=response.status_code,
+                             **response_error_diagnostics(response))
                         raise ReaderError("Runner API " + action + " returned HTTP " + str(response.status_code))
                     data = response.json()
                     if not isinstance(data, dict):
