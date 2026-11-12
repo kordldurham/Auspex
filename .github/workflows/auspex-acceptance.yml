@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: auspex-production-acceptance
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   acceptance:
