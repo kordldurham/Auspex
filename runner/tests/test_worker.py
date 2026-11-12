@@ -1,13 +1,15 @@
 import asyncio
 import base64
 import json
+import io
 import time
 import unittest
 from unittest.mock import AsyncMock, patch
+from contextlib import redirect_stdout
 
 import httpx
 
-from runner.worker import AUDIENCE, SITE, Api, Auth, Collection, Collector, Worker, arguments, observation_chunks, retry_delay
+from runner.worker import AUDIENCE, SITE, Api, Auth, Collection, Collector, Worker, arguments, observation_chunks, retry_delay, oidc_contract_diagnostics, response_error_diagnostics
 
 
 def token(expiry):
@@ -35,6 +37,34 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
             await api.call('release', {'jobId': 'job', 'reason': 'interrupted'})
         self.assertEqual(sum(r.url.host == 'pipelines.actions.githubusercontent.com' for r in calls), 2)
         self.assertNotEqual(calls[1].headers['Authorization'], calls[3].headers['Authorization'])
+
+    def test_oidc_contract_diagnostics_expose_only_matches_types_and_clock_offsets(self):
+        claims = {'repository_id': '1454612846', 'repository_owner_id': '66217662',
+                  'aud': AUDIENCE, 'ref': 'refs/heads/main',
+                  'workflow_ref': 'kordldurham/Auspex/.github/workflows/auspex-scanner.yml@refs/heads/main',
+                  'iss': 'https://token.actions.githubusercontent.com',
+                  'sub': 'repo:kordldurham/Auspex:ref:refs/heads/main',
+                  'run_id': '123', 'event_name': 'push', 'exp': 1200, 'iat': 990,
+                  'private_unexpected_claim': 'DO-NOT-LOG'}
+        with patch('runner.worker.time.time', return_value=1000):
+            diagnostic = oidc_contract_diagnostics(claims, {'alg': 'RS256', 'kid': 'DO-NOT-LOG-KEY'})
+        self.assertTrue(all(diagnostic['matches'].values()))
+        self.assertEqual(diagnostic['types']['repository_id'], 'string')
+        self.assertEqual(diagnostic['expMinusNow'], 200)
+        self.assertEqual(diagnostic['iatMinusNow'], -10)
+        self.assertNotIn('DO-NOT-LOG', json.dumps(diagnostic))
+        claims['repository_id'] = 1454612846
+        self.assertFalse(oidc_contract_diagnostics(claims, {})['matches']['repository_id'])
+
+    def test_response_error_mapping_never_exposes_raw_error_or_headers(self):
+        cases = [(httpx.Response(403, json={'error': 'Authorized GitHub Actions worker identity required'}), 'identity-rejected'),
+                 (httpx.Response(403, json={'error': 'DO-NOT-LOG-SECRET'}), 'unknown-json-error'),
+                 (httpx.Response(403, text='<html>DO-NOT-LOG-SECRET</html>', headers={'content-type': 'text/html', 'x-private': 'DO-NOT-LOG-HEADER'}), 'upstream-nonjson')]
+        for response, expected in cases:
+            diagnostic = response_error_diagnostics(response)
+            self.assertEqual(diagnostic['errorCode'], expected)
+            self.assertNotIn('DO-NOT-LOG', json.dumps(diagnostic))
+            self.assertEqual(set(diagnostic), {'mediaType', 'errorCode'})
 
     async def test_api_does_not_follow_redirect_or_send_auth_to_another_host(self):
         calls = []
