@@ -1,0 +1,43 @@
+name: Auspex production scanner acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - runner/acceptance-config.json
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: auspex-production-acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    if: github.repository == 'kordldurham/Auspex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install controller
+        run: python -m pip install --disable-pip-version-check -r runner/requirements.txt
+      - name: Verify controller and reader
+        run: python -m unittest discover -s runner/tests -v
+      - name: Verify three full scans and interruption recovery
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m runner.acceptance --config runner/acceptance-config.json --output acceptance-proof
+      - name: Preserve sanitized acceptance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auspex-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: acceptance-proof/
+          if-no-files-found: warn
+          retention-days: 30
