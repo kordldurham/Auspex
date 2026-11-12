@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "requestId": "acceptance-1-full-subject-fixed",
-  "forceFull": true,
+  "requestId": "user-disabled-background-updates",
+  "forceFull": false,
   "stopAfterBatches": 0
 }
