@@ -1,8 +1,6 @@
 name: Auspex external scanner
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       force_full:
@@ -24,13 +22,13 @@ permissions:
 
 concurrency:
   group: auspex-prod-single-scanner
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   scan:
     # A copied template/fork does not run a production reader. The backend also
     # enforces immutable numeric repository/owner IDs, ref and workflow identity.
-    if: github.repository == 'kordldurham/Auspex' && vars.AUSPEX_SCANNER_PAUSED != 'true'
+    if: github.event_name != 'push' && github.repository == 'kordldurham/Auspex' && vars.AUSPEX_SCANNER_PAUSED != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
