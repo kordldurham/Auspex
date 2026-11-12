@@ -105,10 +105,15 @@ def oidc_contract_diagnostics(claims: dict[str, Any], header: dict[str, Any]) ->
             **offsets}
 
 
-def response_error_diagnostics(response: httpx.Response) -> dict[str, str]:
+def response_media_type(response: httpx.Response) -> str:
     media = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     # Media labels themselves are bounded; arbitrary header text is never logged.
     media = media if media in {"application/json", "application/problem+json", "text/html", "text/plain", "application/octet-stream"} else "other" if media else "missing"
+    return media
+
+
+def response_error_diagnostics(response: httpx.Response) -> dict[str, str]:
+    media = response_media_type(response)
     try:
         body = response.json()
     except (ValueError, UnicodeDecodeError, RecursionError):
@@ -116,6 +121,18 @@ def response_error_diagnostics(response: httpx.Response) -> dict[str, str]:
     else:
         code = "identity-rejected" if isinstance(body, dict) and body.get("error") == "Authorized GitHub Actions worker identity required" else "unknown-json-error"
     return {"mediaType": media, "errorCode": code}
+
+
+async def public_preflight(client: httpx.AsyncClient) -> None:
+    # Deliberately anonymous and diagnostic only. Never read/log the body and
+    # never treat reachability as authority to execute or bypass runner auth.
+    try:
+        async with asyncio.timeout(20):
+            async with client.stream("GET", SITE + "/api/scans/status") as response:
+                emit("site-preflight", httpStatus=response.status_code,
+                     mediaType=response_media_type(response))
+    except (httpx.TransportError, TimeoutError):
+        emit("site-preflight", httpStatus=None, mediaType="unavailable")
 
 
 def retry_delay(attempt: int, retry_after: str | None = None) -> float:
@@ -519,6 +536,7 @@ async def async_main(args: argparse.Namespace) -> int:
     limits = httpx.Limits(max_connections=max(args.concurrency + 4, 12), max_keepalive_connections=12)
     async with httpx.AsyncClient(follow_redirects=False, timeout=20, limits=limits,
                                  headers={"User-Agent": "AuspexMarketReader/1.0"}) as client:
+        await public_preflight(client)
         runner_id = "gh-" + os.environ.get("GITHUB_RUN_ID", "portable") + "-" + uuid.uuid4().hex
         api = Api(client, Auth(client), runner_id)
         worker = Worker(api, Collector(client, args.concurrency), args.max_runtime_seconds,
