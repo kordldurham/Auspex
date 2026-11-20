@@ -135,6 +135,19 @@ async def public_preflight(client: httpx.AsyncClient) -> None:
         emit("site-preflight", httpStatus=None, mediaType="unavailable")
 
 
+def retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+
 def retry_delay(attempt: int, retry_after: str | None = None) -> float:
     if retry_after:
         try:
@@ -283,6 +296,7 @@ class Collector:
         self.shop_locks: dict[str, asyncio.Lock] = {}
         self.next_request: dict[str, float] = {}
         self.currencies: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.currency_failures: dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def fetch(self, url: str, shop: str) -> dict[str, Any]:
         evidence: dict[str, Any] = {}
@@ -317,7 +331,9 @@ class Collector:
                                 else:
                                     return {**evidence, "status": "collected", "value": product}
                             else:
-                                evidence.update(status="http-error", error="Source HTTP " + str(response.status_code))
+                                evidence.update(status="http-error", error="Source HTTP " + str(response.status_code), retryAfter=response.headers.get("Retry-After"))
+                                if response.status_code == 429 or (response.status_code in RETRYABLE and retry_after_seconds(response.headers.get("Retry-After")) is not None):
+                                    return evidence
                                 # Never follow a changed merchant destination or retry access denials.
                                 if response.status_code not in RETRYABLE:
                                     return evidence
@@ -342,12 +358,19 @@ class Collector:
             if safe_merchant_url(source["url"]) != safe_merchant_url(source["currencyUrl"]):
                 raise ValueError("Product and currency metadata must use the same registered shop origin")
             async with self.shop_locks.setdefault(shop, asyncio.Lock()):
+                failed = self.currency_failures.get(shop)
+                if failed and time.monotonic() < failed[0]:
+                    evidence = failed[1]
+                    return Collection({**base, "collection": {**evidence, "stage": "currency", "reusedCurrencyFailure": True}, "error": "Retailer currency could not be read", "status": evidence.get("httpStatus", 503), "retryAfter": evidence.get("retryAfter")}, None)
                 cached = self.currencies.get(shop)
                 if not cached or time.monotonic() - cached[0] > 240:
                     metadata = await self.fetch(source["currencyUrl"], shop)
                     if metadata.get("status") != "collected":
+                        delay = retry_after_seconds(metadata.get("retryAfter")) or 30
+                        self.currency_failures[shop] = (time.monotonic() + delay, metadata)
                         return Collection({**base, "collection": {**metadata, "stage": "currency"},
-                                           "error": "Retailer currency could not be read", "status": metadata.get("httpStatus", 503)}, None)
+                                           "error": "Retailer currency could not be read", "status": metadata.get("httpStatus", 503), "retryAfter": metadata.get("retryAfter")}, None)
+                    self.currency_failures.pop(shop, None)
                     value = metadata["value"]
                     check = {"id": shop, "currency": value.get("currency") if isinstance(value, dict) else None,
                              "checkedAt": utc(), "responseSha256": metadata["responseSha256"]}
@@ -364,7 +387,7 @@ class Collector:
                     observation["product"] = result["value"]
                 else:
                     observation.update(error=result.get("error", "Source collection failed"),
-                                       status=result.get("httpStatus", 503))
+                                       status=result.get("httpStatus", 503), retryAfter=result.get("retryAfter"))
                 return Collection(observation, check)
         except (KeyError, TypeError, ValueError):
             return Collection({**base, "collection": {"status": "invalid-task"},
