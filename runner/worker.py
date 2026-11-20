@@ -418,9 +418,11 @@ def observation_chunks(results: list[Collection], limit: int = MAX_OBSERVE_BODY)
 
 class Worker:
     def __init__(self, api: Api, collector: Collector, runtime: float = 3600,
-                 stop_after_batches: int | None = None, force_full: bool = False):
+                 stop_after_batches: int | None = None, force_full: bool = False,
+                 max_empty_polls: int = 5):
         self.api, self.collector = api, collector
         self.runtime, self.stop_after_batches, self.force_full = runtime, stop_after_batches, force_full
+        self.max_empty_polls = max(1, max_empty_polls)
         self.stop = asyncio.Event()
         self.job: dict[str, Any] | None = None
         self.batches = 0
@@ -467,6 +469,7 @@ class Worker:
         heart = asyncio.create_task(self.heartbeat())
         reason = "interrupted"
         release_ack = False
+        empty_polls = 0
         try:
             while not self.stop.is_set() and time.monotonic() - started < self.runtime:
                 if heart.done():
@@ -487,8 +490,14 @@ class Worker:
                     if total and completed >= total:
                         reason = "completed"
                         break
+                    empty_polls += 1
+                    if empty_polls >= self.max_empty_polls:
+                        emit("reader-empty-queue-limit", jobId=self.job["id"],
+                             emptyPolls=empty_polls, checkpointPreserved=True)
+                        break
                     await asyncio.sleep(3)
                     continue
+                empty_polls = 0
                 async with asyncio.timeout(max(.001, started + self.runtime - time.monotonic())):
                     results = await asyncio.gather(*(self.collector.collect(source) for source in sources))
                 for chunk in observation_chunks(results):
