@@ -139,7 +139,7 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(result['httpStatus'], 403)
 
-    async def test_retry_after_is_honored_and_bounded(self):
+    async def test_retry_after_is_deferred_to_durable_backend_without_early_retry(self):
         calls = 0
         async def handle(_request):
             nonlocal calls
@@ -148,9 +148,10 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
             with patch('runner.worker.asyncio.sleep', new_callable=AsyncMock) as sleep:
                 result = await Collector(client, attempts=2, shop_interval=0).fetch('https://merchant.example/product', 'shop')
-                sleep.assert_any_await(2.0)
-        self.assertEqual(result['status'], 'collected')
-        self.assertEqual(result['attempts'], 2)
+                sleep.assert_not_awaited()
+        self.assertEqual(result['status'], 'http-error')
+        self.assertEqual(result['retryAfter'], '2')
+        self.assertEqual(result['attempts'], 1)
         self.assertEqual(retry_delay(0, '99999'), 60)
 
     async def test_one_shop_has_only_one_active_request(self):
