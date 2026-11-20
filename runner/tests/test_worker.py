@@ -193,6 +193,20 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.done, [])
         self.assertEqual(api.releases, ['interrupted'])
 
+    async def test_claimed_job_with_empty_queue_stops_and_releases(self):
+        class EmptyQueueApi(FakeApi):
+            async def call(self, action, payload=None):
+                if action == 'tasks':
+                    self.actions.append(action)
+                    return {'job': self.job(), 'sources': []}
+                return await super().call(action, payload)
+
+        api = EmptyQueueApi()
+        result = await Worker(api, FakeCollector(), max_empty_polls=2).run()
+        self.assertEqual(result['status'], 'interrupted')
+        self.assertEqual(api.actions.count('tasks'), 2)
+        self.assertEqual(api.releases, ['interrupted'])
+
     async def test_idle_poll_never_forces_or_creates_job(self):
         api = FakeApi(idle=True)
         result = await Worker(api, FakeCollector()).run()
