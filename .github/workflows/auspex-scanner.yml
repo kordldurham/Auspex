@@ -3,6 +3,10 @@ name: Auspex external scanner
 on:
   workflow_dispatch:
     inputs:
+      include_bbts:
+        description: Explicitly scan registered BBTS listings once
+        type: boolean
+        default: false
       force_full:
         description: Explicitly enqueue a full acceptance scan
         type: boolean
@@ -43,6 +47,7 @@ jobs:
       - name: Claim queued work and read permitted sources
         env:
           REQUEST_EVENT: ${{ github.event_name }}
+          INCLUDE_BBTS: ${{ inputs.include_bbts }}
           FORCE_FULL: ${{ inputs.force_full }}
           STOP_AFTER_BATCHES: ${{ inputs.stop_after_batches }}
         shell: bash
@@ -51,6 +56,7 @@ jobs:
           if [[ "$REQUEST_EVENT" == "push" ]]; then
             args+=(--run-config runner/run-config.json)
           elif [[ "$REQUEST_EVENT" == "workflow_dispatch" ]]; then
+            if [[ "$INCLUDE_BBTS" == "true" ]]; then args+=(--include-bbts); fi
             if [[ "$FORCE_FULL" == "true" ]]; then args+=(--force-full); fi
             if [[ -n "$STOP_AFTER_BATCHES" ]]; then args+=(--stop-after-batches "$STOP_AFTER_BATCHES"); fi
           fi

@@ -19,6 +19,7 @@ import signal
 import time
 import uuid
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -287,24 +288,122 @@ class Collection:
     shop_check: dict[str, Any] | None
 
 
+def manual_bbts_enabled(requested: bool, event: str) -> bool:
+    return requested and event in {"", "workflow_dispatch"}
+
+
+def is_bbts_source(source: dict[str, Any]) -> bool:
+    return source.get("shopId") == "bbts" or urlsplit(str(source.get("url", ""))).hostname in {"www.bigbadtoystore.com", "bigbadtoystore.com"}
+
+
+class ProductJson(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.reading = False
+        self.blocks: list[str] = []
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "script" and dict(attrs).get("type") == "application/ld+json":
+            self.reading = True
+            self.parts = []
+
+    def handle_data(self, data):
+        if self.reading:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self.reading:
+            self.blocks.append("".join(self.parts))
+            self.reading = False
+
+
+def bbts_product(html: str, variation: str) -> dict[str, Any]:
+    parser = ProductJson()
+    parser.feed(html)
+    for block in parser.blocks:
+        value = strict_json(block.encode())
+        products = value if isinstance(value, list) else [value]
+        for product in products:
+            if product.get("@type") != "Product":
+                continue
+            manufacturer = product.get("manufacturer", {})
+            name = manufacturer.get("name") if isinstance(manufacturer, dict) else manufacturer
+            if name != "Games Workshop":
+                continue
+            offers = product.get("offers", [])
+            if isinstance(offers, dict):
+                offers = [offers]
+            selected = [offer for offer in offers if str(offer.get("sku")) == variation]
+            if len(selected) != 1:
+                continue
+            offer = selected[0]
+            if offer.get("priceCurrency") != "USD":
+                raise ValueError("BBTS currency is unverified")
+            price = float(offer["price"])
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("BBTS price is invalid")
+            stock = str(offer.get("availability", "")).rsplit("/", 1)[-1]
+            if stock not in {"InStock", "LimitedAvailability", "PreOrder", "OutOfStock", "SoldOut", "Discontinued"}:
+                raise ValueError("BBTS availability is unverified")
+            cents = round(price * 100)
+            return {"id": product["productID"], "title": product["name"],
+                    "vendor": "Games Workshop", "description": product.get("description", ""),
+                    "price": cents, "bbtsAvailability": stock, "variants": [{"id": variation, "sku": variation,
+                    "price": cents, "available": stock in {"InStock", "LimitedAvailability"}}]}
+    raise ValueError("BBTS exact Games Workshop product offer could not be verified")
+
+
 class Collector:
     def __init__(self, client: httpx.AsyncClient, concurrency: int = 8,
-                 timeout: float = 12, attempts: int = 3, shop_interval: float = 1):
+                 timeout: float = 12, attempts: int = 3, shop_interval: float = 1,
+                 shop_concurrency: int = 2, include_bbts: bool = False):
         self.client = client
         self.global_limit = asyncio.Semaphore(concurrency)
         self.timeout, self.attempts, self.shop_interval = timeout, attempts, shop_interval
+        self.include_bbts = include_bbts
+        self.shop_concurrency = max(1, min(shop_concurrency, concurrency))
+        self.request_limits: dict[str, asyncio.Semaphore] = {}
+        self.schedule_locks: dict[str, asyncio.Lock] = {}
+        self.failures: dict[str, int] = {}
+        self.suspended_until: dict[str, float] = {}
+        self.bbts_attempted: set[str] = set()
         self.shop_locks: dict[str, asyncio.Lock] = {}
         self.next_request: dict[str, float] = {}
         self.currencies: dict[str, tuple[float, dict[str, Any]]] = {}
         self.currency_failures: dict[str, tuple[float, dict[str, Any]]] = {}
 
-    async def fetch(self, url: str, shop: str) -> dict[str, Any]:
-        evidence: dict[str, Any] = {}
-        for attempt in range(self.attempts):
+    async def schedule(self, shop: str) -> dict[str, Any] | None:
+        # Reserve request start times without holding the currency lock or a global slot.
+        async with self.schedule_locks.setdefault(shop, asyncio.Lock()):
+            remaining = self.suspended_until.get(shop, 0) - time.monotonic()
+            if remaining > 0:
+                return {"status": "circuit-open", "error": "Retailer cooling down",
+                        "httpStatus": 503, "retryAfter": str(math.ceil(remaining))}
+            if shop in self.suspended_until:
+                self.suspended_until.pop(shop)
+                self.failures[shop] = 0
             wait = self.next_request.get(shop, 0) - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
             self.next_request[shop] = time.monotonic() + self.shop_interval
+        return None
+
+    def record_result(self, shop: str, retryable: bool) -> None:
+        self.failures[shop] = self.failures.get(shop, 0) + 1 if retryable else 0
+        if self.failures[shop] >= 3:
+            self.suspended_until[shop] = time.monotonic() + min(120, 30 * 2 ** min(2, self.failures[shop] - 3))
+
+    async def fetch(self, url: str, shop: str) -> dict[str, Any]:
+        async with self.request_limits.setdefault(shop, asyncio.Semaphore(self.shop_concurrency)):
+            return await self.fetch_attempts(url, shop)
+
+    async def fetch_attempts(self, url: str, shop: str) -> dict[str, Any]:
+        evidence: dict[str, Any] = {}
+        for attempt in range(self.attempts):
+            suspended = await self.schedule(shop)
+            if suspended:
+                return suspended
             started = time.monotonic()
             body = bytearray()
             try:
@@ -321,6 +420,7 @@ class Collector:
                                         "responseSha256": hashlib.sha256(raw).hexdigest(),
                                         "responseBytes": len(raw), "attempts": attempt + 1,
                                         "elapsedMs": round((time.monotonic() - started) * 1000)}
+                            self.record_result(shop, response.status_code in RETRYABLE)
                             if response.status_code == 200:
                                 try:
                                     product = strict_json(raw)
@@ -341,6 +441,7 @@ class Collector:
                 if attempt + 1 < self.attempts:
                     await asyncio.sleep(retry_delay(attempt, after))
             except (httpx.TransportError, TimeoutError, ValueError) as error:
+                self.record_result(shop, not isinstance(error, ValueError))
                 evidence = {"status": "timeout" if isinstance(error, TimeoutError) else "collection-error",
                             "error": "Source collection deadline exceeded" if isinstance(error, TimeoutError)
                             else "Source response too large" if isinstance(error, ValueError)
@@ -355,6 +456,8 @@ class Collector:
         base = {"id": identity, "fetchedAt": utc()}
         try:
             shop = str(source["shopId"])
+            if is_bbts_source(source):
+                return await self.collect_bbts(source)
             if safe_merchant_url(source["url"]) != safe_merchant_url(source["currencyUrl"]):
                 raise ValueError("Product and currency metadata must use the same registered shop origin")
             async with self.shop_locks.setdefault(shop, asyncio.Lock()):
@@ -380,18 +483,61 @@ class Collector:
                 if check["currency"] != "USD":
                     return Collection({**base, "collection": {"status": "currency-unverified", "stage": "currency"},
                                        "error": "Retailer currency is not verified USD", "status": 400}, check)
-                result = await self.fetch(source["url"], shop)
-                observation = {"id": identity, "fetchedAt": utc(),
-                               "collection": {k: v for k, v in result.items() if k != "value"}}
-                if result.get("status") == "collected":
-                    observation["product"] = result["value"]
-                else:
-                    observation.update(error=result.get("error", "Source collection failed"),
-                                       status=result.get("httpStatus", 503), retryAfter=result.get("retryAfter"))
-                return Collection(observation, check)
+            result = await self.fetch(source["url"], shop)
+            observation = {"id": identity, "fetchedAt": utc(),
+                           "collection": {k: v for k, v in result.items() if k != "value"}}
+            if result.get("status") == "collected":
+                observation["product"] = result["value"]
+            else:
+                observation.update(error=result.get("error", "Source collection failed"),
+                                   status=result.get("httpStatus", 503), retryAfter=result.get("retryAfter"))
+            return Collection(observation, check)
         except (KeyError, TypeError, ValueError):
             return Collection({**base, "collection": {"status": "invalid-task"},
                                "error": "Registered source task has invalid collection coordinates", "status": 400}, None)
+
+
+    async def collect_bbts(self, source: dict[str, Any]) -> Collection:
+        base = {"id": source["id"], "fetchedAt": utc()}
+        url = source["url"]
+        if not self.include_bbts:
+            return Collection({**base, "error": "BBTS requires an explicit manual scan",
+                               "collection": {"status": "manual-required"}, "status": 400}, None)
+        if url in self.bbts_attempted:
+            return Collection({**base, "error": "BBTS already attempted in this manual scan",
+                               "collection": {"status": "manual-attempt-complete"}, "status": 400}, None)
+        self.bbts_attempted.add(url)
+        try:
+            safe_merchant_url(url)
+            parsed = urlsplit(url)
+            variation = parsed.path.removeprefix("/Product/VariationDetails/")
+            if parsed.hostname not in {"www.bigbadtoystore.com", "bigbadtoystore.com"} or not variation.isdigit() or parsed.query:
+                raise ValueError("BBTS requires an exact public variation URL")
+            async with self.request_limits.setdefault("bbts", asyncio.Semaphore(1)):
+                suspended = await self.schedule("bbts")
+                if suspended:
+                    return Collection({**base, "collection": suspended, "error": suspended["error"], "status": 503}, None)
+                async with self.global_limit:
+                    async with asyncio.timeout(self.timeout):
+                        async with self.client.stream("GET", url, follow_redirects=False) as response:
+                            raw = bytearray()
+                            async for part in response.aiter_bytes():
+                                raw.extend(part)
+                                if len(raw) > MAX_BODY:
+                                    raise ValueError("BBTS response exceeded size limit")
+                            if response.status_code != 200:
+                                raise ValueError("BBTS access unavailable (HTTP " + str(response.status_code) + ")")
+                product = bbts_product(bytes(raw).decode("utf-8"), variation)
+            if str(product["id"]) != str(source["sourceProductId"]):
+                raise ValueError("BBTS product identity differs from registered source")
+            product["handle"] = source["handle"]
+            return Collection({**base, "product": product, "collection": {
+                "status": "collected", "httpStatus": 200, "attempts": 1,
+                "responseSha256": hashlib.sha256(raw).hexdigest()}},
+                {"id": source["shopId"], "currency": "USD", "checkedAt": utc()})
+        except (ValueError, KeyError, httpx.TransportError, TimeoutError) as error:
+            return Collection({**base, "error": str(error), "status": 400,
+                               "collection": {"status": "bbts-unavailable", "attempts": 1}}, None)
 
 
 def observation_chunks(results: list[Collection], limit: int = MAX_OBSERVE_BODY) -> list[list[Collection]]:
@@ -480,6 +626,15 @@ class Worker:
                     reason = "cancelled"
                     break
                 sources = tasks.get("sources") or []
+                if sources and all(is_bbts_source(source) for source in sources) and not self.collector.include_bbts:
+                    reason = "manual-retailer-pending"
+                    break
+                sources = [source for source in sources if not is_bbts_source(source) or
+                           self.collector.include_bbts and source.get("url") not in self.collector.bbts_attempted]
+                if not sources and any(is_bbts_source(source) for source in tasks.get("sources", [])):
+                    reason = "manual-retailer-attempted"
+                    break
+
                 if self.job.get("status") == "timed-out":
                     emit("reader-job-deadline", jobId=self.job["id"], checkpointPreserved=True)
                     break
@@ -541,6 +696,7 @@ class Worker:
 
 def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--include-bbts", action="store_true", help="Explicitly include BBTS once in this manual invocation")
     parser.add_argument("--force-full", action="store_true", help="Explicitly enqueue a full acceptance run")
     parser.add_argument("--stop-after-batches", type=int)
     parser.add_argument("--max-runtime-seconds", type=int, default=3600)
@@ -571,7 +727,7 @@ async def async_main(args: argparse.Namespace) -> int:
         await public_preflight(client)
         runner_id = "gh-" + os.environ.get("GITHUB_RUN_ID", "portable") + "-" + uuid.uuid4().hex
         api = Api(client, Auth(client), runner_id)
-        worker = Worker(api, Collector(client, args.concurrency), args.max_runtime_seconds,
+        worker = Worker(api, Collector(client, args.concurrency, include_bbts=manual_bbts_enabled(args.include_bbts, os.environ.get("GITHUB_EVENT_NAME", ""))), args.max_runtime_seconds,
                         args.stop_after_batches, args.force_full)
         loop = asyncio.get_running_loop()
         for name in (signal.SIGTERM, signal.SIGINT):
