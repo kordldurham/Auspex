@@ -1,11 +1,6 @@
 [Unit]
-Description=Poll Auspex's durable scan queue
+Description=Auspex recurring reader disabled (on-demand only)
+ConditionPathExists=/dev/null/auspex-recurring-disabled
 
 [Timer]
-OnBootSec=1min
-OnUnitInactiveSec=5min
-Persistent=true
 Unit=auspex-reader.service
-
-[Install]
-WantedBy=timers.target
