@@ -11,10 +11,6 @@ on:
         description: Deliberately interrupt after N persisted batches (blank runs normally)
         type: string
         default: ''
-  push:
-    branches: [main]
-    paths:
-      - runner/run-config.json
 
 permissions:
   contents: read
